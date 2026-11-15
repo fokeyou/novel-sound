@@ -147,6 +147,15 @@ jobs:
           ls -lh ios/Frameworks/
           lipo -info ios/Frameworks/libfqapi_core.a
 
+      # 听书 / 真人讲书的 CENC 解密核心。必须在 flutter build 之前产出，
+      # 否则 ios/Flutter/*.xcconfig 里的 -force_load 找不到 libspcrypto.a。
+      - name: Build C crypto core for iOS (arm64)
+        run: |
+          set -euo pipefail
+          bash scripts/build_crypto_ios.sh
+          echo "--- ios/Frameworks/ ---"
+          ls -lh ios/Frameworks/
+
       - name: Flutter build iOS (release, no codesign)
         run: |
           set -euo pipefail
