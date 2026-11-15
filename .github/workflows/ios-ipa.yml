@@ -1,0 +1,201 @@
+# novel-sound / 什锦铺 —— 云端构建「未签名 iOS IPA」
+#
+# 用法：把本文件放到你自己 fork 仓库的 .github/workflows/ 下，
+#       然后 Actions -> iOS IPA (unsigned) -> Run workflow。
+#       构建完成后在该次运行的 Artifacts 里下载 novel-sound-ios-unsigned-ipa.zip，
+#       解压得到 novel-sound-unsigned.ipa，可直接交给 TrollStore 安装。
+#
+# 为什么用 xcode-27：项目 IOS.md 明确要求 macOS 27.2+ / Xcode 27.2 / Flutter 3.50.0，
+# GitHub 于 2026-10-15 将 xcode-27（macOS 27, arm64, Xcode 27 工具链）转为 GA。
+# 公共仓库的标准 macOS runner 免费；若遇到磁盘/内存不足，把 runs-on 改成
+# xcode-27-xlarge（需 Team/Enterprise 且计费）。
+#
+# 本 workflow 只产出【未签名】IPA：项目本身不入库 DEVELOPMENT_TEAM，
+# 未签名包适合 TrollStore 直装；如需免费 Apple ID 自签（7 天），请在本地另跑签名脚本。
+
+name: iOS IPA (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: 'macOS runner 标签（磁盘不足时选 xcode-27-xlarge）'
+        required: true
+        default: 'xcode-27'
+        type: choice
+        options:
+          - xcode-27
+          - xcode-27-xlarge
+  # fork 里通过网页新建本文件后，push 会自动触发首次构建（不用手动点 Run workflow）。
+  push:
+    branches: [master]
+    paths:
+      - 'ios/**'
+      - 'rust/**'
+      - 'lib/**'
+      - 'scripts/build_rust_ios.sh'
+      - 'pubspec.lock'
+      - '.github/workflows/ios-ipa.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # IOS.md / pubspec.lock / android-apk.yml 三处一致的工具链版本，勿随意改动。
+  FLUTTER_VERSION: '3.50.0'
+  RUST_VERSION: '1.99.1'
+  COCOAPODS_MIN_VERSION: '1.17.0'
+  CARGO_BUILD_JOBS: '2'
+  CARGO_TERM_COLOR: always
+  # release profile 的 strip=true 会裁掉静态库符号，build_rust_ios.sh 内部已覆盖为 debuginfo。
+
+jobs:
+  ipa:
+    runs-on: ${{ inputs.runner_label || 'xcode-27' }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+        working-directory: app
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          path: app
+          persist-credentials: false
+
+      - name: Print runner environment
+        run: |
+          echo "runner.os      = ${{ runner.os }}"
+          echo "runner.arch    = ${{ runner.arch }}"
+          sw_vers
+          echo "--- installed Xcode apps ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          df -h / | tail -1
+
+      - name: Select the highest available Xcode 27 toolchain
+        run: |
+          set -euo pipefail
+          # 优先 27.2（IOS.md 验证过的版本），其次 27.1 / 27.0 / 默认 Xcode.app。
+          for cand in \
+            /Applications/Xcode_27.2.app \
+            /Applications/Xcode_27.2_beta.app \
+            /Applications/Xcode_27.1.app \
+            /Applications/Xcode_27.app \
+            /Applications/Xcode.app ; do
+            if [ -d "$cand" ]; then
+              echo "==> xcode-select: $cand"
+              sudo xcode-select -s "$cand/Contents/Developer"
+              break
+            fi
+          done
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          sudo xcodebuild -license accept || true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: aarch64-apple-ios
+          components: rustfmt
+
+      - name: Cache Cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app/rust
+
+      - name: Ensure CocoaPods is available
+        run: |
+          set -euo pipefail
+          if command -v pod >/dev/null 2>&1; then
+            echo "CocoaPods: $(pod --version)"
+          else
+            echo "CocoaPods 缺失，使用 Homebrew 安装（IOS.md 要求不要用系统 Ruby gem 装）"
+            brew install cocoapods
+            echo "CocoaPods: $(pod --version)"
+          fi
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      - name: Configure Flutter
+        run: |
+          set -euo pipefail
+          # IOS.md: Xcode 27 + Swift Package Manager 有已知构建失败，必须关闭。
+          flutter config --no-enable-swift-package-manager --no-analytics
+          flutter --version
+          flutter doctor -v || true
+
+      - name: Resolve Dart dependencies
+        run: flutter pub get --enforce-lockfile
+
+      - name: Build Rust static library for iOS (arm64)
+        run: |
+          set -euo pipefail
+          bash scripts/build_rust_ios.sh
+          echo "--- ios/Frameworks/ ---"
+          ls -lh ios/Frameworks/
+          lipo -info ios/Frameworks/libfqapi_core.a
+
+      - name: Flutter build iOS (release, no codesign)
+        run: |
+          set -euo pipefail
+          # --no-codesign: 不入库 DEVELOPMENT_TEAM，产出未签名 Runner.app。
+          flutter build ios --release --no-codesign --no-pub
+          echo "--- build/ios/iphoneos/ ---"
+          ls -lh build/ios/iphoneos/ | head -20
+
+      - name: Pack unsigned IPA
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/ipa && mkdir -p /tmp/ipa/Payload
+          ditto build/ios/iphoneos/Runner.app /tmp/ipa/Payload/Runner.app
+          (cd /tmp/ipa && zip -qry novel-sound-unsigned.ipa Payload)
+          ls -lh /tmp/ipa/novel-sound-unsigned.ipa
+
+      - name: Verify IPA contents
+        run: |
+          set -euo pipefail
+          IPA=/tmp/ipa/novel-sound-unsigned.ipa
+          unzip -t "$IPA" | tail -2
+          rm -rf /tmp/ipa-check && mkdir -p /tmp/ipa-check
+          unzip -q "$IPA" -d /tmp/ipa-check
+          APP=/tmp/ipa-check/Payload/Runner.app
+          echo "CFBundleIdentifier  = $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")"
+          echo "CFBundleDisplayName = $(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$APP/Info.plist")"
+          echo "MinimumOSVersion    = $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")"
+          echo "Executable archs    = $(lipo -archs "$APP/Runner")"
+          echo "Signature state     = $(codesign -dv "$APP" 2>&1 | head -1 || true)  # 未签名符合预期"
+          echo "IPA size            = $(du -h "$IPA" | cut -f1)"
+          shasum -a 256 "$IPA" | tee /tmp/ipa/novel-sound-unsigned.ipa.sha256
+          test -s "$APP/Runner" || { echo "::error::Runner 可执行文件缺失"; exit 1; }
+          lipo -archs "$APP/Runner" | grep -q arm64 || { echo "::error::产物不是 arm64"; exit 1; }
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: novel-sound-ios-unsigned-ipa
+          path: |
+            /tmp/ipa/novel-sound-unsigned.ipa
+            /tmp/ipa/novel-sound-unsigned.ipa.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "### iOS IPA 构建结果" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Runner: \`${{ inputs.runner_label || 'xcode-27' }}\` / Xcode 27 / Flutter ${{ env.FLUTTER_VERSION }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 产物：Artifact \`novel-sound-ios-unsigned-ipa\`（未签名，TrollStore 可直装）" >> "$GITHUB_STEP_SUMMARY"
