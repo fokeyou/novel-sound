@@ -151,10 +151,10 @@ private let fqPlayerEventChannel = "fqapp/native_player/events"
 /// 有了它，错误提示里会直接带「装的是哪一版、卡在哪一步、读了多少字节」，
 /// 不用再靠猜。`build` 是版本标记——界面上的提示里没有 `[v3]` 就说明装的还是旧包。
 enum FqDiag {
-  static let build = "v3"
+  static let build = "v4"
   private static let lock = NSLock()
   private static var lines: [String] = []
-  private static let limit = 10
+  private static let limit = 40
 
   static func add(_ line: String) {
     lock.lock()
@@ -170,11 +170,124 @@ enum FqDiag {
     return copy.joined(separator: " ")
   }
 
+  static func dump() -> String {
+    lock.lock()
+    let copy = lines
+    lock.unlock()
+    return copy.isEmpty ? "(无记录)" : copy.joined(separator: "\n")
+  }
+
   static func fail(_ message: String) -> String {
     let trace = tail
     return trace.isEmpty
       ? "[\(build)] \(message)"
       : "[\(build)] \(message) | \(trace)"
+  }
+}
+
+// MARK: - 诊断浮层
+//
+// Dart 侧 `_fail()` 只把无法识别的错误显示成「播放出错，请稍后重试」——
+// 原生这边辛苦拼出来的 C 错误原文、AVFoundation domain/code、字节级进度，
+// 到界面上一个字都不剩。改 Dart 要动业务代码，风险更大。
+//
+// 所以在原生层单开一个 UIWindow 把它们铺在屏幕上：既不依赖 Flutter 的文案
+// 映射，也不会被路由/弹窗覆盖。定位完问题就把这一段连同调用一起删掉。
+final class FqOverlay {
+  static let shared = FqOverlay()
+
+  private var window: UIWindow?
+  private var textView: UITextView?
+  private var payload = ""
+
+  static func show(_ title: String, _ detail: String) {
+    shared.present(title, detail)
+  }
+
+  private func present(_ title: String, _ detail: String) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      self.payload = title + "\n\n" + detail
+      if let existing = self.textView {
+        existing.text = self.payload
+        self.window?.isHidden = false
+        return
+      }
+      guard let scene = self.activeScene() else { return }
+
+      let win = UIWindow(windowScene: scene)
+      win.windowLevel = .alert + 1
+      let root = UIViewController()
+      root.view.backgroundColor = UIColor.black.withAlphaComponent(0.95)
+
+      let text = UITextView()
+      text.translatesAutoresizingMaskIntoConstraints = false
+      text.backgroundColor = .clear
+      text.textColor = UIColor(white: 0.96, alpha: 1)
+      text.font = UIFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
+      text.isEditable = false
+      text.isSelectable = true
+      text.text = self.payload
+      text.textContainerInset = UIEdgeInsets(top: 14, left: 10, bottom: 14, right: 10)
+      root.view.addSubview(text)
+
+      let copy = self.makeButton("复制全文", filled: true)
+      copy.addTarget(self, action: #selector(self.copyTapped), for: .touchUpInside)
+      let close = self.makeButton("关闭", filled: false)
+      close.addTarget(self, action: #selector(self.closeTapped), for: .touchUpInside)
+      root.view.addSubview(copy)
+      root.view.addSubview(close)
+
+      let guide = root.view.safeAreaLayoutGuide
+      NSLayoutConstraint.activate([
+        text.topAnchor.constraint(equalTo: guide.topAnchor, constant: 8),
+        text.leadingAnchor.constraint(equalTo: root.view.leadingAnchor, constant: 8),
+        text.trailingAnchor.constraint(equalTo: root.view.trailingAnchor, constant: -8),
+        text.bottomAnchor.constraint(equalTo: copy.topAnchor, constant: -10),
+
+        copy.leadingAnchor.constraint(equalTo: root.view.leadingAnchor, constant: 16),
+        copy.trailingAnchor.constraint(equalTo: root.view.trailingAnchor, constant: -16),
+        copy.heightAnchor.constraint(equalToConstant: 46),
+        copy.bottomAnchor.constraint(equalTo: close.topAnchor, constant: -10),
+
+        close.leadingAnchor.constraint(equalTo: copy.leadingAnchor),
+        close.trailingAnchor.constraint(equalTo: copy.trailingAnchor),
+        close.heightAnchor.constraint(equalToConstant: 46),
+        close.bottomAnchor.constraint(equalTo: guide.bottomAnchor, constant: -12),
+      ])
+
+      win.rootViewController = root
+      win.isHidden = false
+      self.window = win
+      self.textView = text
+    }
+  }
+
+  private func makeButton(_ title: String, filled: Bool) -> UIButton {
+    let button = UIButton(type: .system)
+    button.translatesAutoresizingMaskIntoConstraints = false
+    button.setTitle(title, for: .normal)
+    button.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+    button.setTitleColor(.white, for: .normal)
+    button.backgroundColor =
+      filled ? UIColor(red: 0.85, green: 0.20, blue: 0.22, alpha: 1) : UIColor(white: 0.22, alpha: 1)
+    button.layer.cornerRadius = 10
+    return button
+  }
+
+  private func activeScene() -> UIWindowScene? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    return scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+  }
+
+  @objc private func copyTapped() {
+    UIPasteboard.general.string = payload
+  }
+
+  @objc private func closeTapped() {
+    window?.isHidden = true
+    window = nil
+    textView = nil
   }
 }
 
@@ -354,7 +467,12 @@ final class FqAudioPlayer {
 
   private func emitError(_ message: String) {
     // 统一带上版本标记和诊断尾巴：界面上一眼能看出是不是新包、卡在哪一步。
-    emit("error", ["message": FqDiag.fail(message)])
+    let full = FqDiag.fail(message)
+    emit("error", ["message": full])
+    // Dart 的 `_fail()` 把不认识的错误一律显示成「播放出错，请稍后重试」，
+    // 上面这串详细信息一个字都不会出现在界面上。浮层不经过 Flutter，
+    // 所以这里是唯一保证能被看到的地方。
+    FqOverlay.show("播放失败诊断", full + "\n\n——— 过程 ———\n" + FqDiag.dump())
   }
 
   /// Dart 的 `create()` 只有在收到 created 后才认为播放器可用。
@@ -376,8 +494,16 @@ final class FqAudioPlayer {
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { return }
 
+      // 先判定容器类型，结果无论如何都记进诊断：C 核心后面失败时，
+      // 这一行就是「该不该解密」的直接证据。
+      let probe = FqMp4Probe.describe(url: self.url)
+      FqDiag.add("mp4:\(probe)")
+      let plain = FqMp4Probe.isPlain(probe)
+      if plain && !self.keyHex.isEmpty { FqDiag.add("bypass:plain") }
+
       let asset: AVURLAsset
-      if self.keyHex.isEmpty {
+      if self.keyHex.isEmpty || plain {
+        // 明文容器：再解密就是破坏数据。直接让 AVPlayer 走原始 https。
         asset = AVURLAsset(
           url: self.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
       } else {
@@ -390,6 +516,14 @@ final class FqAudioPlayer {
         // 所以把 https 换成 fqapp-crypto，真正的下载仍在 delegate 里按原始 URL 做。
         var components = URLComponents(url: self.url, resolvingAgainstBaseURL: false)
         components?.scheme = SpCryptoLoader.scheme
+        // AVFoundation 会用 path 扩展名推断容器类型。CDN 地址常是
+        // `/audio?sign=...` 这种没有扩展名的形式，补一个 .mp4 让它少走弯路。
+        if let path = components?.path, !path.isEmpty {
+          let ext = (path as NSString).pathExtension.lowercased()
+          if !["mp4", "m4a", "aac", "mp3"].contains(ext) {
+            components?.path = path + ".mp4"
+          }
+        }
         let wrapped = components?.url ?? self.url
         let wrappedAsset = AVURLAsset(url: wrapped)
         wrappedAsset.resourceLoader.setDelegate(loader, queue: loader.queue)
@@ -410,8 +544,14 @@ final class FqAudioPlayer {
     // 听书常见 1.25x–2x：timeDomain 保证变速不变调，与 Android 的 WSOLA 目标一致。
     newItem.audioTimePitchAlgorithm = .timeDomain
     let newPlayer = AVPlayer(playerItem: newItem)
-    newPlayer.automaticallyWaitsToMinimizeStalling = true
+    // resourceLoader 是同步拉取式供给，AVPlayer 默认会等「足够缓冲」才开播，
+    // 等不到就一直 waiting（表现为一直转圈）。关掉后它会立即尝试解码，
+    // 数据不够再自行等待，问题也会以具体的 error 暴露出来。
+    newPlayer.automaticallyWaitsToMinimizeStalling = false
     newPlayer.volume = volume
+    // 只预留 5 秒：自定义数据源是「要多少给多少」，设太大会让播放器
+    // 一开始就索要大量数据，反而推迟 readyToPlay。
+    newItem.preferredForwardBufferDuration = 5
     item = newItem
     player = newPlayer
     observe(item: newItem, player: newPlayer)
@@ -423,6 +563,20 @@ final class FqAudioPlayer {
         current.status != .readyToPlay
       else { return }
       self.emitError("播放器 15s 未就绪")
+    }
+
+    // 第三个看门狗，专门抓「状态正常但根本没动」：时长出来了（说明解析成功、
+    // status 已是 readyToPlay）、用户也想播，可 8 秒过去播放位置还是 0。
+    // 这种情况下前两个看门狗都不会响，界面只会安静地停在 00:00。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+      guard let self, !self.disposed, self.wantPlay,
+        let currentItem = self.item, let currentPlayer = self.player,
+        currentItem.status == .readyToPlay,
+        CMTimeGetSeconds(currentPlayer.currentTime()) < 0.15
+      else { return }
+      let keepUp = currentItem.isPlaybackLikelyToKeepUp
+      let reason = currentPlayer.reasonForWaitingToPlay?.rawValue ?? "none"
+      self.emitError("已就绪但 8s 无进度 keepUp=\(keepUp) wait=\(reason)")
     }
 
     if startMs > 0 {
@@ -548,8 +702,13 @@ final class FqAudioPlayer {
   static func activateSession() {
     let session = AVAudioSession.sharedInstance()
     // spokenAudio + playback：锁屏/后台继续放，且走语音优化路由。
-    try? session.setCategory(.playback, mode: .spokenAudio)
-    try? session.setActive(true)
+    do {
+      try session.setCategory(.playback, mode: .spokenAudio)
+      try session.setActive(true)
+    } catch {
+      // 静默失败会表现成「状态在播但没声音」，必须留痕。
+      FqDiag.add("sess:\((error as NSError).code)")
+    }
   }
 
   func dispose() {
@@ -575,6 +734,61 @@ final class FqAudioPlayer {
     stream?.close()
     stream = nil
     bridge?.remove(id)
+  }
+}
+
+// MARK: - 容器探测
+//
+// 只拉文件头 64KB 就够判断：CENC 的样本描述一定是 `enca`，并且带 `sinf`
+// （内含 `cenc`/`cbcs` scheme）；普通明文 mp4 是 `mp4a` 且没有任何 `sinf`。
+//
+// 这一步完全走 URLSession，不经过 C 核心，所以即使解密链路打不开，
+// 也能回答那个最根本的问题：这份音频到底需不需要解密。
+enum FqMp4Probe {
+  static func describe(url: URL) -> String {
+    guard !url.isFileURL else { return "file" }
+    guard let data = head(url), !data.isEmpty else { return "net:fail" }
+    var marks: [String] = []
+    if has(data, "enca") { marks.append("enca") }
+    if has(data, "sinf") { marks.append("sinf") }
+    if has(data, "cenc") { marks.append("cenc") }
+    if has(data, "cbcs") { marks.append("cbcs") }
+    if has(data, "mp4a") { marks.append("mp4a") }
+    marks.append(has(data, "moov") ? "moov" : "no-moov")
+    return marks.joined(separator: "+") + "/\(data.count)B"
+  }
+
+  /// moov 在头部、且完全找不到加密标记 —— 这种文件按明文播就是对的。
+  static func isPlain(_ described: String) -> Bool {
+    described.contains("moov")
+      && !described.contains("no-moov")
+      && !described.contains("sinf")
+      && !described.contains("enca")
+  }
+
+  private static func has(_ data: Data, _ ascii: String) -> Bool {
+    data.range(of: Data(ascii.utf8)) != nil
+  }
+
+  private static func head(_ url: URL) -> Data? {
+    var request = URLRequest(url: url)
+    request.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
+    request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+    request.timeoutInterval = 8
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.timeoutIntervalForRequest = 8
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    let session = URLSession(configuration: configuration)
+    defer { session.finishTasksAndInvalidate() }
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var payload: Data?
+    session.dataTask(with: request) { data, _, _ in
+      payload = data
+      semaphore.signal()
+    }.resume()
+    if semaphore.wait(timeout: .now() + 9) == .timedOut { return nil }
+    return payload
   }
 }
 
@@ -682,6 +896,26 @@ final class SpCryptoStream {
     return queue.sync {
       guard let current = liveHandle() else { return -1 }
       var error = sp_error()
+      return sp_stream_read(current, buffer, length, &error)
+    }
+  }
+
+  /// 「定位 + 读取」必须是一次原子操作。
+  ///
+  /// AVPlayer 会**并发**发多个区间请求。原来的写法是外层 seek、内层循环 read，
+  /// 两者各排一次队：A 的 seek(0) 之后、A 的 read 之前，B 的 seek(800000)
+  /// 完全可能插进来，于是 A 读到的是 B 位置的数据。字节整体错位，播放器
+  /// 会解析出一个「语法合法但内容是乱的」容器，最后只报一句播放出错。
+  ///
+  /// 每次读都带上绝对偏移，seek 与 read 在同一队列里连续完成，才不会被插队。
+  func readRange(
+    offset: Int64, into buffer: UnsafeMutablePointer<UInt8>, length: Int
+  ) -> Int {
+    if length <= 0 { return 0 }
+    return queue.sync {
+      guard let current = liveHandle() else { return -1 }
+      var error = sp_error()
+      guard sp_stream_seek(current, offset, &error) >= 0 else { return -1 }
       return sp_stream_read(current, buffer, length, &error)
     }
   }
@@ -1012,8 +1246,9 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
       // 我们的 IO 层对任意 offset 都能读（206 走 Range；200 落盘后按文件切片），
       // 所以无条件声明支持字节范围。长度拿不到就留空，AVPlayer 会自己摸。
       info.isByteRangeAccessSupported = true
-      let total = stream.size
-      if total > 0 { info.contentLength = total }
+      let length = stream.size
+      if length > 0 { info.contentLength = length }
+      FqDiag.add("CI:\(length)")
     }
 
     guard let dataRequest = loadingRequest.dataRequest else {
@@ -1022,11 +1257,23 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
     }
 
     let start = dataRequest.requestedOffset
-    let end = start + Int64(dataRequest.requestedLength)
+    // AVAssetResourceLoadingDataRequest 有两种「长度」语义：明确的字节数，
+    // 或者 requestsAllDataToEndOfResource（此时 requestedLength 是 0/极大值）。
+    // 早先一律 start + requestedLength，遇到后者就变成 end == start，
+    // 循环一次都不执行，直接 finishLoading()——AVPlayer 收到 0 字节，
+    // 却按 contentLength 一直等其余的，最后就报「播放出错」。
+    let total = stream.size
+    let requested = Int64(dataRequest.requestedLength)
+    let wantsTail = dataRequest.requestsAllDataToEndOfResource || requested <= 0
+    let end: Int64
+    if wantsTail {
+      end = total > 0 ? total : start + 1_048_576
+    } else {
+      end = start &+ requested
+    }
 
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { return }
-      _ = self.stream.seek(to: start)
       var offset = start
       var chunk = [UInt8](repeating: 0, count: 128 * 1024)
       while offset < end, !loadingRequest.isCancelled {
@@ -1034,7 +1281,7 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
         if want <= 0 { break }
         let read = chunk.withUnsafeMutableBufferPointer { buffer -> Int in
           guard let base = buffer.baseAddress else { return -1 }
-          return self.stream.read(into: base, length: want)
+          return self.stream.readRange(offset: offset, into: base, length: want)
         }
         if read < 0 {
           // 读失败必须明确告诉 AVPlayer。直接 finishLoading() 等于宣告「数据就
