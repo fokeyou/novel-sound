@@ -154,7 +154,7 @@ enum FqDiag {
   static let build = "v4"
   private static let lock = NSLock()
   private static var lines: [String] = []
-  private static let limit = 40
+  private static let limit = 70
 
   static func add(_ line: String) {
     lock.lock()
@@ -448,6 +448,9 @@ final class FqAudioPlayer {
   private(set) var volume: Float = 1
   private(set) var defaultRate: Double = 1
 
+  /// 诊断前缀。
+  private var tag: String { "p\(id)" }
+
   init(id: Int, url: URL, keyHex: String, bridge: FqPlayerBridge) {
     self.id = id
     self.url = url
@@ -483,7 +486,7 @@ final class FqAudioPlayer {
   // MARK: 准备
 
   func prepare(startMs: Int) {
-    FqDiag.add("P:start")
+    FqDiag.add("\(tag)|P:start")
     // 看门狗：sp_stream_open() 是同步 C 调用，卡在里面无法从外部中断。
     // Dart 那边要等 25 秒才抛超时，用户只能看到「加载超时」这种没信息的话；
     // 这里 12 秒就把真实进度推过去。
@@ -497,9 +500,9 @@ final class FqAudioPlayer {
       // 先判定容器类型，结果无论如何都记进诊断：C 核心后面失败时，
       // 这一行就是「该不该解密」的直接证据。
       let verdict = FqMp4Probe.inspect(url: self.url)
-      FqDiag.add("probe:\(verdict.described)")
+      FqDiag.add("\(self.tag)|probe:\(verdict.described)")
       let plain = verdict.plain
-      if plain && !self.keyHex.isEmpty { FqDiag.add("bypass:plain") }
+      if plain && !self.keyHex.isEmpty { FqDiag.add("\(self.tag)|bypass:plain") }
 
       let asset: AVURLAsset
       if self.keyHex.isEmpty || plain {
@@ -507,7 +510,7 @@ final class FqAudioPlayer {
         asset = AVURLAsset(
           url: self.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
       } else {
-        guard let stream = SpCryptoStream(url: self.url, keyHex: self.keyHex) else {
+        guard let stream = SpCryptoStream(url: self.url, keyHex: self.keyHex, tag: self.tag) else {
           self.emitError("加密流打开失败：\(SpCryptoStream.lastOpenError)")
           return
         }
@@ -555,7 +558,7 @@ final class FqAudioPlayer {
     item = newItem
     player = newPlayer
     observe(item: newItem, player: newPlayer)
-    FqDiag.add("A:\(asset.url.scheme ?? "?")")
+    FqDiag.add("\(tag)|A:\(asset.url.scheme ?? "?")")
     // 第二个看门狗：attachment 建好了、AVPlayer 15 秒还没 ready，说明喂进去的
     // 数据不够，或者它不认这个容器。不报的话用户只会看到一直转圈。
     DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
@@ -611,7 +614,7 @@ final class FqAudioPlayer {
       switch item.status {
       case .readyToPlay:
         let seconds = CMTimeGetSeconds(item.duration)
-        FqDiag.add("ready:\(Int(seconds))s")
+        FqDiag.add("\(self.tag)|ready:\(Int(seconds))s")
         if seconds.isFinite, seconds > 0 {
           self.emit("duration", Int(seconds * 1000))
         }
@@ -890,15 +893,16 @@ final class SpCryptoStream {
   /// 错误提示，用户截一张图就能定位。
   private(set) static var lastOpenError = ""
 
-  init?(url: URL, keyHex: String) {
-    FqDiag.add("K:\(keyHex.count)")
+  init?(url: URL, keyHex: String, tag: String) {
+    let note: (String) -> Void = { FqDiag.add(tag.isEmpty ? $0 : "\(tag)|\($0)") }
+    note("K:\(keyHex.count)")
     guard let key = SpCryptoStream.decodeKey(keyHex) else {
       SpCryptoStream.lastOpenError =
         "密钥格式异常（\(keyHex.count) 个字符，应为 32 位十六进制）"
-      FqDiag.add("K:bad")
+      note("K:bad")
       return nil
     }
-    let ctx = SpIOContext(url: url)
+    let ctx = SpIOContext(url: url, tag: tag)
     context = ctx
 
     let user = Unmanaged.passRetained(ctx).toOpaque()
@@ -923,11 +927,11 @@ final class SpCryptoStream {
       }
       let head = "C 核心返回 \(code)"
       SpCryptoStream.lastOpenError = detail.isEmpty ? head : "\(head)：\(detail)"
-      FqDiag.add("O:\(code)")
+      note("O:\(code)")
       Unmanaged<SpIOContext>.fromOpaque(user).release()
       return nil
     }
-    FqDiag.add("O:ok")
+    note("O:ok")
     handle = opened
   }
 
@@ -1068,14 +1072,21 @@ final class SpIOContext {
   private var cancelGeneration = 0
   private var readCount = 0
   private let lock = NSLock()
+  /// 诊断前缀（p1 / p2…）。换声音时同时存在多个播放器，日志不加前缀分不清。
+  private let tag: String
 
-  init(url: URL) {
+  init(url: URL, tag: String) {
     self.url = url
+    self.tag = tag
     let configuration = URLSessionConfiguration.ephemeral
     configuration.timeoutIntervalForRequest = 30
     configuration.timeoutIntervalForResource = 120
     configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
     session = URLSession(configuration: configuration)
+  }
+
+  private func note(_ line: String) {
+    FqDiag.add(tag.isEmpty ? line : "\(tag)|\(line)")
   }
 
   func invalidate() {
@@ -1106,7 +1117,7 @@ final class SpIOContext {
     // 15 秒：这一步会被 AVPlayer 的 contentInformationRequest 串行等待，
     // 拖太久会让「解析头部」看起来像死机。
     guard let (data, http) = fetch(request, timeout: 10) else {
-      FqDiag.add("S:timeout")
+      note("S:timeout")
       return -1
     }
 
@@ -1117,7 +1128,7 @@ final class SpIOContext {
       lock.lock()
       cachedSize = total
       lock.unlock()
-      FqDiag.add("S:\(total)")
+      note("S:\(total)")
       return total
     }
 
@@ -1126,7 +1137,7 @@ final class SpIOContext {
     // 现在的降级路径：把这份响应体落盘，之后按本地文件随机读。
     if http.statusCode == 200 {
       if !data.isEmpty, let total = cacheBody(data) {
-        FqDiag.add("S200:\(total)")
+        note("S200:\(total)")
         return total
       }
       if let declared = http.value(forHTTPHeaderField: "Content-Length")
@@ -1135,11 +1146,11 @@ final class SpIOContext {
         lock.lock()
         cachedSize = declared
         lock.unlock()
-        FqDiag.add("S200h:\(declared)")
+        note("S200h:\(declared)")
         return declared
       }
     }
-    FqDiag.add("S:\(http.statusCode)")
+    note("S:\(http.statusCode)")
     return -1
   }
 
@@ -1148,7 +1159,7 @@ final class SpIOContext {
     readCount += 1
     // 只记前几次和所有失败：C 核心一集要读几十上百次，全记会把日志冲干净。
     if readCount <= 4 || result < 0 {
-      FqDiag.add("R\(readCount)@\(offset)+\(length)=\(result)")
+      note("R\(readCount)@\(offset)+\(length)=\(result)")
     }
     return result
   }
@@ -1208,7 +1219,7 @@ final class SpIOContext {
     cancelGeneration &+= 1
     let task = currentTask
     lock.unlock()
-    FqDiag.add("C#\(cancelGeneration)")
+    note("C#\(cancelGeneration)")
     task?.cancel()
   }
 
@@ -1353,6 +1364,7 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
       guard let self else { return }
       var offset = start
       var chunk = [UInt8](repeating: 0, count: 128 * 1024)
+      var retries = 0
       while offset < end, !loadingRequest.isCancelled {
         let want = Int(min(Int64(chunk.count), end - offset))
         if want <= 0 { break }
@@ -1361,9 +1373,22 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
           return self.stream.readRange(offset: offset, into: base, length: want)
         }
         if read < 0 {
-          // 读失败必须明确告诉 AVPlayer。直接 finishLoading() 等于宣告「数据就
-          // 到这里」，而 contentLength 说的是几 MB，它只会一直等剩下的字节，
-          // 永远不进入 readyToPlay —— 表现就是「一直转圈然后超时」。
+          // 一次失败很可能只是这一跳网络抖动。3MB 的文件里任何一次读失败
+          // 都会让整个 item 废掉，代价太大，所以同一偏移先重试一次。
+          if retries < 1 {
+            retries += 1
+            continue
+          }
+        }
+        retries = 0
+        if read < 0 {
+          // 请求已经作废（换声音、拖动进度、切章都会走到这里）：静默退出。
+          // 对一个已取消的请求调 finishLoading(with:) 会让 AVPlayer 把这次
+          // 失败记在整个 item 上，接着就是 NSOSStatusErrorDomain -1。
+          if loadingRequest.isCancelled { return }
+          // 真正读失败必须明确告诉 AVPlayer。直接 finishLoading() 等于宣告
+          // 「数据就到这里」，而 contentLength 说的是几 MB，它只会一直等剩下
+          // 的字节，永远不进入 readyToPlay —— 表现就是「一直转圈然后超时」。
           loadingRequest.finishLoading(
             with: NSError(
               domain: "fqapp.crypto", code: -1,
@@ -1383,8 +1408,17 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
   func resourceLoader(
     _ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest
   ) {
-    // 打断正在阻塞的那一次范围请求；后续 seek 仍可继续（头文件明确允许）。
-    stream.cancel()
+    // 这里**不能**调 stream.cancel()。
+    //
+    // C 侧的 stream 只有一个，cancel 是无差别的：AVPlayer 会同时持有多个
+    // 区间请求，取消其中一个（换声音、拖动进度都会）会把另一个正在读的
+    // 请求一起打断，那次读返回 -1，我们于是对一个仍然有效的请求报错，
+    // 整个 item 直接 failed —— 界面上就是
+    // 「The operation could not be completed [NSOSStatusErrorDomain -1]」。
+    //
+    // 被打断的请求本身已经 isCancelled，下面循环会立刻退出，respond 也会
+    // 被播放器忽略，代价只是多读几百 KB。真正需要打断的是销毁播放器，
+    // 那条路径走 SpCryptoStream.close()。
   }
 }
 
