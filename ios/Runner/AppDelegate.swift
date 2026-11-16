@@ -20,6 +20,8 @@ import UIKit
     // 听书 / 真人讲书：Android 走 ExoPlayer + crypto:// 自定义 DataSource，
     // iOS 之前完全没有实现，补齐后 Dart 侧同一套通道契约即可复用。
     FqPlayerBridge.register(messenger: messenger)
+    // 智能朗读：Android 走 TextToSpeech，iOS 用 AVSpeechSynthesizer。
+    FqTtsBridge.register(messenger: messenger)
   }
 }
 
@@ -143,6 +145,39 @@ struct KeychainError: LocalizedError {
 private let fqPlayerChannel = "fqapp/native_player"
 private let fqPlayerEventChannel = "fqapp/native_player/events"
 
+/// 轻量诊断环：只留最近十条，失败时拼进错误文案。
+///
+/// 为什么要这个：TrollStore 装的包没有 Xcode 控制台，出问题只能靠用户截图。
+/// 有了它，错误提示里会直接带「装的是哪一版、卡在哪一步、读了多少字节」，
+/// 不用再靠猜。`build` 是版本标记——界面上的提示里没有 `[v3]` 就说明装的还是旧包。
+enum FqDiag {
+  static let build = "v3"
+  private static let lock = NSLock()
+  private static var lines: [String] = []
+  private static let limit = 10
+
+  static func add(_ line: String) {
+    lock.lock()
+    lines.append(line)
+    if lines.count > limit { lines.removeFirst(lines.count - limit) }
+    lock.unlock()
+  }
+
+  static var tail: String {
+    lock.lock()
+    let copy = lines
+    lock.unlock()
+    return copy.joined(separator: " ")
+  }
+
+  static func fail(_ message: String) -> String {
+    let trace = tail
+    return trace.isEmpty
+      ? "[\(build)] \(message)"
+      : "[\(build)] \(message) | \(trace)"
+  }
+}
+
 final class FqPlayerBridge: NSObject, FlutterStreamHandler {
   static let shared = FqPlayerBridge()
 
@@ -150,6 +185,9 @@ final class FqPlayerBridge: NSObject, FlutterStreamHandler {
   private var players: [Int: FqAudioPlayer] = [:]
   private var nextPlayerId = 1
   private var eventSink: FlutterEventSink?
+  /// Dart 还没开始监听事件通道时先存着。`create` 的回复和 created 事件可能
+  /// 抢在 EventChannel 的 listen 之前到达，丢掉 created 会让调用方白等 25 秒。
+  private var pendingEmits: [[String: Any]] = []
 
   static func register(messenger: FlutterBinaryMessenger) {
     let channel = FlutterMethodChannel(name: fqPlayerChannel, binaryMessenger: messenger)
@@ -167,7 +205,10 @@ final class FqPlayerBridge: NSObject, FlutterStreamHandler {
   {
     lock.lock()
     eventSink = events
+    let backlog = pendingEmits
+    pendingEmits.removeAll()
     lock.unlock()
+    for payload in backlog { events(payload) }
     return nil
   }
 
@@ -182,12 +223,16 @@ final class FqPlayerBridge: NSObject, FlutterStreamHandler {
   func emit(_ payload: [String: Any]) {
     lock.lock()
     let sink = eventSink
+    if sink == nil {
+      if pendingEmits.count < 32 { pendingEmits.append(payload) }
+      lock.unlock()
+      return
+    }
     lock.unlock()
-    guard let sink else { return }
     if Thread.isMainThread {
-      sink(payload)
+      sink?(payload)
     } else {
-      DispatchQueue.main.async { sink(payload) }
+      DispatchQueue.main.async { sink?(payload) }
     }
   }
 
@@ -245,9 +290,12 @@ final class FqPlayerBridge: NSObject, FlutterStreamHandler {
     players[id] = player
     lock.unlock()
 
-    // 与 Android 一致：先回 playerId（textureId 对纯音频无意义，回 -1），
-    // 准备完成后再补一个 created 事件。
+    // 与 Android 一致：先回 playerId（textureId 对纯音频无意义，回 -1）。
     result(["playerId": id, "textureId": -1])
+    // created 必须在这里就发，不能等 prepare() 走完：prepare 第一步是
+    // sp_stream_open()，那是同步网络读（探长度 + 拉 moov），CDN 慢起来十几秒
+    // 起步，而 Dart 侧 create 只给 25 秒。先宣告就绪，真正的失败后面走 error 事件。
+    player.announceCreated()
     player.prepare(startMs: startMs)
   }
 
@@ -294,9 +342,37 @@ final class FqAudioPlayer {
     self.bridge = bridge
   }
 
+  /// 发事件**必须**带 `playerId`。
+  ///
+  /// Dart 侧 `NativePlayer._dispatchEvent` 第一件事就是 `event['playerId']`，
+  /// 拿不到 num 直接 return——整条事件被静默丢弃。之前漏了这个字段，
+  /// created 永远到不了 Dart，`create()` 25 秒后抛超时，UI 就卡在
+  /// 「正在加载音频」再变成「加载超时，请检查网络后重试」。
+  private func emit(_ type: String, _ value: Any) {
+    bridge?.emit(["playerId": id, "type": type, "value": value])
+  }
+
+  private func emitError(_ message: String) {
+    // 统一带上版本标记和诊断尾巴：界面上一眼能看出是不是新包、卡在哪一步。
+    emit("error", ["message": FqDiag.fail(message)])
+  }
+
+  /// Dart 的 `create()` 只有在收到 created 后才认为播放器可用。
+  func announceCreated() {
+    emit("created", -1)
+  }
+
   // MARK: 准备
 
   func prepare(startMs: Int) {
+    FqDiag.add("P:start")
+    // 看门狗：sp_stream_open() 是同步 C 调用，卡在里面无法从外部中断。
+    // Dart 那边要等 25 秒才抛超时，用户只能看到「加载超时」这种没信息的话；
+    // 这里 12 秒就把真实进度推过去。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 12) { [weak self] in
+      guard let self, !self.disposed, self.item == nil else { return }
+      self.emitError("准备超时 12s：解密流未就绪")
+    }
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       guard let self else { return }
 
@@ -306,7 +382,7 @@ final class FqAudioPlayer {
           url: self.url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
       } else {
         guard let stream = SpCryptoStream(url: self.url, keyHex: self.keyHex) else {
-          self.bridge?.emit(["type": "error", "value": ["message": "加密流打开失败"]])
+          self.emitError("加密流打开失败：\(SpCryptoStream.lastOpenError)")
           return
         }
         let loader = SpCryptoLoader(stream: stream)
@@ -339,6 +415,15 @@ final class FqAudioPlayer {
     item = newItem
     player = newPlayer
     observe(item: newItem, player: newPlayer)
+    FqDiag.add("A:\(asset.url.scheme ?? "?")")
+    // 第二个看门狗：attachment 建好了、AVPlayer 15 秒还没 ready，说明喂进去的
+    // 数据不够，或者它不认这个容器。不报的话用户只会看到一直转圈。
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+      guard let self, !self.disposed, let current = self.item,
+        current.status != .readyToPlay
+      else { return }
+      self.emitError("播放器 15s 未就绪")
+    }
 
     if startMs > 0 {
       newPlayer.seek(
@@ -346,7 +431,8 @@ final class FqAudioPlayer {
         toleranceBefore: .zero,
         toleranceAfter: .zero)
     }
-    bridge?.emit(["type": "created", "value": -1])
+    // created 已经由 handleCreate 立刻发出（纯音频没有纹理，值恒为 -1），
+    // 这里不再重复——重复发虽然无害，但会让「谁负责宣告就绪」变成两处。
     if wantPlay {
       FqAudioPlayer.activateSession()
       newPlayer.play()
@@ -359,13 +445,22 @@ final class FqAudioPlayer {
       switch item.status {
       case .readyToPlay:
         let seconds = CMTimeGetSeconds(item.duration)
+        FqDiag.add("ready:\(Int(seconds))s")
         if seconds.isFinite, seconds > 0 {
-          self.bridge?.emit(["type": "duration", "value": Int(seconds * 1000)])
+          self.emit("duration", Int(seconds * 1000))
         }
-        self.bridge?.emit(["type": "firstFrame"])
+        self.emit("firstFrame", true)
       case .failed:
-        let message = item.error?.localizedDescription ?? "播放失败"
-        self.bridge?.emit(["type": "error", "value": ["message": message]])
+        // 直接把 NSError 的 domain/code 一起带上：AVFoundation 的 -11800 只是
+        // 「未知错误」，真正的线索在其 underlying error（例如 -12746 明文校验失败）。
+        let error = item.error as NSError?
+        let underlying = error?.userInfo[NSUnderlyingErrorKey] as? NSError
+        let detail =
+          underlying.map { "\($0.domain) \($0.code)" }
+          ?? error.map { "\($0.domain) \($0.code)" }
+          ?? "unknown"
+        self.emitError(
+          "\(error?.localizedDescription ?? "播放失败") [\(detail)]")
       default:
         break
       }
@@ -375,8 +470,8 @@ final class FqAudioPlayer {
       [weak self] player, _ in
       guard let self, !self.disposed else { return }
       let playing = player.timeControlStatus == .playing
-      self.bridge?.emit(["type": "playing", "value": playing])
-      self.bridge?.emit(["type": "playWhenReady", "value": player.rate > 0])
+      self.emit("playing", playing)
+      self.emit("playWhenReady", player.rate > 0)
     }
 
     timeObserver = newPlayer.addPeriodicTimeObserver(
@@ -385,12 +480,12 @@ final class FqAudioPlayer {
       guard let self, !self.disposed else { return }
       let ms = Int(CMTimeGetSeconds(time) * 1000)
       if ms >= 0 {
-        self.bridge?.emit(["type": "position", "value": ms])
+        self.emit("position", ms)
       }
       let buffering = !(self.item?.isPlaybackLikelyToKeepUp ?? true)
       if buffering != self.lastBuffering {
         self.lastBuffering = buffering
-        self.bridge?.emit(["type": "buffering", "value": buffering])
+        self.emit("buffering", buffering)
       }
     }
 
@@ -399,8 +494,8 @@ final class FqAudioPlayer {
     ) { [weak self] _ in
       guard let self, !self.disposed else { return }
       self.wantPlay = false
-      self.bridge?.emit(["type": "completed", "value": true])
-      self.bridge?.emit(["type": "playing", "value": false])
+      self.emit("completed", true)
+      self.emit("playing", false)
     }
   }
 
@@ -497,8 +592,21 @@ final class SpCryptoStream {
   private let queue = DispatchQueue(label: "fq.crypto.stream.ops")
   private let context: SpIOContext
 
+  /// 上一次 open 失败的原因。
+  ///
+  /// C 侧的 `sp_error.message` 有 192 字节，写得相当具体（哪一步、期望什么、
+  /// 实际拿到什么）。之前直接丢掉了，出问题时等于蒙着眼睛——现在原样带进
+  /// 错误提示，用户截一张图就能定位。
+  private(set) static var lastOpenError = ""
+
   init?(url: URL, keyHex: String) {
-    guard let key = SpCryptoStream.decodeKey(keyHex) else { return nil }
+    FqDiag.add("K:\(keyHex.count)")
+    guard let key = SpCryptoStream.decodeKey(keyHex) else {
+      SpCryptoStream.lastOpenError =
+        "密钥格式异常（\(keyHex.count) 个字符，应为 32 位十六进制）"
+      FqDiag.add("K:bad")
+      return nil
+    }
     let ctx = SpIOContext(url: url)
     context = ctx
 
@@ -518,9 +626,17 @@ final class SpCryptoStream {
     io.deallocate()
 
     guard let opened else {
+      let code = error.code.rawValue
+      let detail = withUnsafePointer(to: &error.message) { pointer in
+        pointer.withMemoryRebound(to: CChar.self, capacity: 192) { String(cString: $0) }
+      }
+      let head = "C 核心返回 \(code)"
+      SpCryptoStream.lastOpenError = detail.isEmpty ? head : "\(head)：\(detail)"
+      FqDiag.add("O:\(code)")
       Unmanaged<SpIOContext>.fromOpaque(user).release()
       return nil
     }
+    FqDiag.add("O:ok")
     handle = opened
   }
 
@@ -577,18 +693,24 @@ final class SpCryptoStream {
   }
 
   func close() {
-    let current: OpaquePointer? = queue.sync {
+    guard let current = liveHandle() else { return }
+    // 先打断可能正在阻塞的那次网络读，再排队关闭：FqAudioPlayer.dispose 在主线程
+    // 调用，直接 queue.sync 会被一次 60 秒的 URLSession 拖住，界面就假死了。
+    sp_stream_cancel(current)
+    queue.async { [self] in
       pointerLock.lock()
-      defer { pointerLock.unlock() }
-      if closed { return nil }
+      if closed {
+        pointerLock.unlock()
+        return
+      }
       closed = true
       let handle = self.handle
       self.handle = nil
-      return handle
-    }
-    if let current {
-      // C 侧在 close 里回调 io.close，释放我们 passRetained 的 context。
-      sp_stream_close(current)
+      pointerLock.unlock()
+      if let handle {
+        // C 侧在 close 里回调 io.close，释放我们 passRetained 的 context。
+        sp_stream_close(handle)
+      }
     }
   }
 }
@@ -627,7 +749,13 @@ final class SpIOContext {
   private let session: URLSession
   private var cachedSize: Int64 = -1
   private var currentTask: URLSessionDataTask?
-  private var cancelled = false
+  /// 服务器忽略 Range（回 200 整份响应）时的落盘缓存：命中后 size / read 全走本地文件，
+  /// 否则每次 128KB 读都要重下整个几十 MB 的音频。
+  private var fullBodyURL: URL?
+  /// 每次 cancel 自增。read 只判断「我这一次请求有没有被打断」，
+  /// 不能用布尔标志——那会把流永久废掉：seek 打断一次之后就再也读不出数据。
+  private var cancelGeneration = 0
+  private var readCount = 0
   private let lock = NSLock()
 
   init(url: URL) {
@@ -641,6 +769,11 @@ final class SpIOContext {
 
   func invalidate() {
     session.invalidateAndCancel()
+    lock.lock()
+    let cached = fullBodyURL
+    fullBodyURL = nil
+    lock.unlock()
+    if let cached { try? FileManager.default.removeItem(at: cached) }
   }
 
   func size() -> Int64 {
@@ -649,7 +782,7 @@ final class SpIOContext {
       let length = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
       return length > 0 ? length : -1
     }
-    // 注意：NSLock 不可重入，perform() 内部要拿同一把锁，所以这里不能跨调用持锁。
+    // 注意：NSLock 不可重入，fetch() 内部要拿同一把锁，所以这里不能跨调用持锁。
     lock.lock()
     let cached = cachedSize
     lock.unlock()
@@ -659,78 +792,162 @@ final class SpIOContext {
     request.httpMethod = "GET"
     request.setValue("bytes=0-0", forHTTPHeaderField: "Range")
     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-    let (_, response) = perform(request)
-    // 必须拿到 206 且 Content-Range 带总长度：206 之外的响应证明不了支持 Range，
-    // 盲目往下读会在 seek 时拿到错位数据。
-    guard let http = response, http.statusCode == 206,
-      let total = SpIOContext.totalLength(from: http), total > 0
-    else {
+    // 15 秒：这一步会被 AVPlayer 的 contentInformationRequest 串行等待，
+    // 拖太久会让「解析头部」看起来像死机。
+    guard let (data, http) = fetch(request, timeout: 10) else {
+      FqDiag.add("S:timeout")
       return -1
     }
-    lock.lock()
-    cachedSize = total
-    lock.unlock()
-    return total
+
+    // 首选 206：Content-Range 同时证明了「总长度」和「支持随机读」。
+    if http.statusCode == 206,
+      let total = SpIOContext.totalLength(from: http), total > 0
+    {
+      lock.lock()
+      cachedSize = total
+      lock.unlock()
+      FqDiag.add("S:\(total)")
+      return total
+    }
+
+    // 很多 CDN 直接无视 Range 回 200 + 整份响应体。以前这里一律返回 -1，
+    // sp_stream_open 拿不到长度就连 moov 都解析不了，UI 只能干等到超时。
+    // 现在的降级路径：把这份响应体落盘，之后按本地文件随机读。
+    if http.statusCode == 200 {
+      if !data.isEmpty, let total = cacheBody(data) {
+        FqDiag.add("S200:\(total)")
+        return total
+      }
+      if let declared = http.value(forHTTPHeaderField: "Content-Length")
+        .flatMap({ Int64($0) }), declared > 0
+      {
+        lock.lock()
+        cachedSize = declared
+        lock.unlock()
+        FqDiag.add("S200h:\(declared)")
+        return declared
+      }
+    }
+    FqDiag.add("S:\(http.statusCode)")
+    return -1
   }
 
   func read(offset: UInt64, buffer: UnsafeMutablePointer<UInt8>, length: Int) -> Int {
-    if length <= 0 { return 0 }
-    if url.isFileURL {
-      return readFile(offset: offset, buffer: buffer, length: length)
+    let result = readInner(offset: offset, buffer: buffer, length: length)
+    readCount += 1
+    // 只记前几次和所有失败：C 核心一集要读几十上百次，全记会把日志冲干净。
+    if readCount <= 4 || result < 0 {
+      FqDiag.add("R\(readCount)@\(offset)+\(length)=\(result)")
     }
+    return result
+  }
+
+  private func readInner(offset: UInt64, buffer: UnsafeMutablePointer<UInt8>, length: Int) -> Int {
+    if length <= 0 { return 0 }
     lock.lock()
-    let stopped = cancelled
+    let local = fullBodyURL
+    let known = cachedSize
     lock.unlock()
-    if stopped { return -1 }
+    if let local { return readFile(at: local, offset: offset, buffer: buffer, length: length) }
+    if url.isFileURL {
+      return readFile(at: url, offset: offset, buffer: buffer, length: length)
+    }
+    // 已知总长且已越过末尾：直接 EOF，别再打一次注定 416 的请求。
+    if known > 0, Int64(offset) >= known { return 0 }
+
+    lock.lock()
+    let generation = cancelGeneration
+    lock.unlock()
 
     let end = offset &+ UInt64(length) &- 1
     var request = URLRequest(url: url)
     request.httpMethod = "GET"
     request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
-    let (data, response) = perform(request)
-    guard let data, !data.isEmpty, let http = response,
-      http.statusCode == 206 || http.statusCode == 200
-    else {
+    guard let (data, http) = fetch(request, timeout: 12) else { return -1 }
+    lock.lock()
+    let interrupted = cancelGeneration != generation
+    lock.unlock()
+    if interrupted { return -1 }
+
+    switch http.statusCode {
+    case 206:
+      // 空 body 是 EOF，不是错误。C 核心靠 0 判断「读完了」，给 -1 会被当成
+      // 故障——一旦当成故障，上层就会以为整段数据到此为止，播放器永远等不完。
+      if data.isEmpty { return 0 }
+      let count = min(data.count, length)
+      copy(data, from: 0, into: buffer, count: count)
+      return count
+    case 200:
+      // 服务器忽略 Range，body 是整份文件：按 offset 切片，并顺手落盘，
+      // 让后续 read 直接命中本地缓存。
+      let start = Int(offset)
+      guard start < data.count else { return 0 }
+      let count = min(length, data.count - start)
+      copy(data, from: start, into: buffer, count: count)
+      _ = cacheBody(data)
+      return count
+    default:
       return -1
     }
-    let count = min(data.count, length)
-    data.withUnsafeBytes { raw in
-      if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-        buffer.update(from: base, count: count)
-      }
-    }
-    return count
   }
 
   func cancel() {
     lock.lock()
-    cancelled = true
+    cancelGeneration &+= 1
     let task = currentTask
     lock.unlock()
+    FqDiag.add("C#\(cancelGeneration)")
     task?.cancel()
   }
 
-  private func readFile(offset: UInt64, buffer: UnsafeMutablePointer<UInt8>, length: Int) -> Int {
-    guard let handle = FileHandle(forReadingAtPath: url.path) else { return -1 }
+  /// 把整份响应体写到临时目录，返回长度；失败返回 nil 并保持原状。
+  private func cacheBody(_ data: Data) -> Int64? {
+    let target = FileManager.default.temporaryDirectory
+      .appendingPathComponent("fq-crypto-\(UUID().uuidString).bin")
+    do {
+      try data.write(to: target, options: .atomic)
+    } catch {
+      return nil
+    }
+    lock.lock()
+    let previous = fullBodyURL
+    fullBodyURL = target
+    cachedSize = Int64(data.count)
+    lock.unlock()
+    if let previous { try? FileManager.default.removeItem(at: previous) }
+    return Int64(data.count)
+  }
+
+  private func readFile(
+    at fileURL: URL, offset: UInt64, buffer: UnsafeMutablePointer<UInt8>, length: Int
+  ) -> Int {
+    guard let handle = FileHandle(forReadingAtPath: fileURL.path) else { return -1 }
     defer { try? handle.close() }
     do {
       try handle.seek(toOffset: offset)
       guard let data = try handle.read(upToCount: length) else { return 0 }
       if data.isEmpty { return 0 }
-      data.withUnsafeBytes { raw in
-        if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
-          buffer.update(from: base, count: data.count)
-        }
-      }
+      copy(data, from: 0, into: buffer, count: data.count)
       return data.count
     } catch {
       return -1
     }
   }
 
+  private func copy(
+    _ data: Data, from start: Int, into buffer: UnsafeMutablePointer<UInt8>, count: Int
+  ) {
+    guard count > 0, start >= 0, start + count <= data.count else { return }
+    data.withUnsafeBytes { raw in
+      if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+        buffer.update(from: base.advanced(by: start), count: count)
+      }
+    }
+  }
+
   /// C 回调是同步的，这里用信号量把 URLSession 的异步结果拉平。
-  private func perform(_ request: URLRequest) -> (Data?, HTTPURLResponse?) {
+  private func fetch(_ request: URLRequest, timeout: TimeInterval) -> (Data, HTTPURLResponse)? {
     let semaphore = DispatchSemaphore(value: 0)
     var payload: Data?
     var response: HTTPURLResponse?
@@ -744,16 +961,15 @@ final class SpIOContext {
     lock.unlock()
     task.resume()
 
-    if semaphore.wait(timeout: .now() + 60) == .timedOut {
-      task.cancel()
-      lock.lock()
-      currentTask = nil
-      lock.unlock()
-      return (nil, nil)
-    }
+    let outcome = semaphore.wait(timeout: .now() + timeout)
     lock.lock()
     currentTask = nil
     lock.unlock()
+    if outcome == .timedOut {
+      task.cancel()
+      return nil
+    }
+    guard let payload, let response else { return nil }
     return (payload, response)
   }
 
@@ -775,6 +991,7 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
   let queue = DispatchQueue(label: "fq.crypto.loader")
 
   private let stream: SpCryptoStream
+  private var loggedFirstRequest = false
 
   init(stream: SpCryptoStream) {
     self.stream = stream
@@ -785,14 +1002,18 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
     _ resourceLoader: AVAssetResourceLoader,
     shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
   ) -> Bool {
+    if !loggedFirstRequest {
+      loggedFirstRequest = true
+      FqDiag.add("LR")
+    }
     if let info = loadingRequest.contentInformationRequest {
       // CENC 只加密样本数据，moov/mvhd 仍是明文，所以 MIME 与时长能被正常解析。
       info.contentType = "audio/mp4"
+      // 我们的 IO 层对任意 offset 都能读（206 走 Range；200 落盘后按文件切片），
+      // 所以无条件声明支持字节范围。长度拿不到就留空，AVPlayer 会自己摸。
+      info.isByteRangeAccessSupported = true
       let total = stream.size
-      if total > 0 {
-        info.contentLength = total
-        info.isByteRangeAccessSupported = true
-      }
+      if total > 0 { info.contentLength = total }
     }
 
     guard let dataRequest = loadingRequest.dataRequest else {
@@ -815,7 +1036,17 @@ final class SpCryptoLoader: NSObject, AVAssetResourceLoaderDelegate {
           guard let base = buffer.baseAddress else { return -1 }
           return self.stream.read(into: base, length: want)
         }
-        if read <= 0 { break }
+        if read < 0 {
+          // 读失败必须明确告诉 AVPlayer。直接 finishLoading() 等于宣告「数据就
+          // 到这里」，而 contentLength 说的是几 MB，它只会一直等剩下的字节，
+          // 永远不进入 readyToPlay —— 表现就是「一直转圈然后超时」。
+          loadingRequest.finishLoading(
+            with: NSError(
+              domain: "fqapp.crypto", code: -1,
+              userInfo: [NSLocalizedDescriptionKey: FqDiag.fail("解密流读取失败 @\(offset)")]))
+          return
+        }
+        if read == 0 { break }
         dataRequest.respond(with: Data(bytes: chunk, count: read))
         offset += Int64(read)
         if dataRequest.currentOffset >= end { break }
@@ -855,5 +1086,250 @@ enum FqNowPlaying {
 
   static func clear() {
     MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+  }
+}
+
+// MARK: - 系统朗读（AVSpeechSynthesizer）
+//
+// 对应 `lib/services/system_tts.dart` 的 `fqapp/system_tts` +
+// `fqapp/system_tts_events`。Android 走 TextToSpeech，iOS 用 AVSpeechSynthesizer，
+// 通道契约逐字对齐，Dart 侧一行都不用改。
+//
+// 事件约定（见 `SystemTtsPlayback._event`）：
+//   {type: "start"|"range"|"done"|"error", id}、{type: "interrupted", keepFocus}、
+//   {type: "focus_resume"}、{type: "engine_stopped"}。
+// `range` 的 start 是相对本段文本的 UTF-16 偏移——和 Dart String 的索引单位
+// 一致，正好可以直接加到 _text 的游标上。
+
+final class FqTtsBridge: NSObject, FlutterStreamHandler, AVSpeechSynthesizerDelegate {
+  static let shared = FqTtsBridge()
+
+  private let synthesizer = AVSpeechSynthesizer()
+  private let lock = NSLock()
+  private var eventSink: FlutterEventSink?
+  /// utterance → Dart 侧那个 `id`。AVSpeechSynthesizer 只回 utterance 对象本身，
+  /// 没有 id 字段，只能自己建映射（对象身份作 key）。
+  private var utteranceIds: [ObjectIdentifier: String] = [:]
+  private var voice: AVSpeechSynthesisVoice?
+  private var rate: Float = 1
+  private var volume: Float = 1
+  private var observingInterruptions = false
+
+  static func register(messenger: FlutterBinaryMessenger) {
+    let channel = FlutterMethodChannel(name: "fqapp/system_tts", binaryMessenger: messenger)
+    channel.setMethodCallHandler { call, result in
+      FqTtsBridge.shared.handle(call, result: result)
+    }
+    let events = FlutterEventChannel(
+      name: "fqapp/system_tts_events", binaryMessenger: messenger)
+    events.setStreamHandler(FqTtsBridge.shared)
+    // delegate 必须在任何 speak 之前挂上，否则 start/range/done 一个都收不到，
+    // Dart 侧就只能停在「正在切换声音」。
+    let bridge = FqTtsBridge.shared
+    bridge.synthesizer.delegate = bridge
+    bridge.startObservingInterruptions()
+  }
+
+  // MARK: FlutterStreamHandler
+
+  func onListen(withArguments arguments: Any?, eventSink events: @escaping FlutterEventSink)
+    -> FlutterError?
+  {
+    lock.lock()
+    eventSink = events
+    lock.unlock()
+    return nil
+  }
+
+  func onCancel(withArguments arguments: Any?) -> FlutterError? {
+    lock.lock()
+    eventSink = nil
+    lock.unlock()
+    return nil
+  }
+
+  private func emit(_ payload: [String: Any]) {
+    lock.lock()
+    let sink = eventSink
+    lock.unlock()
+    guard let sink else { return }
+    if Thread.isMainThread {
+      sink(payload)
+    } else {
+      DispatchQueue.main.async { sink(payload) }
+    }
+  }
+
+  // MARK: 方法分发
+
+  private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
+    let args = (call.arguments as? [String: Any]) ?? [:]
+    switch call.method {
+    case "engines":
+      // 只暴露中文音色：这本书是中文正文，日语/英语音色念出来全是拼音。
+      let voices = AVSpeechSynthesisVoice.speechVoices().filter {
+        $0.language.hasPrefix("zh")
+      }
+      // 注意不能写 `x?.identifier as Any`：那会把 Optional 装箱塞进 codec，
+      // Flutter 的 StandardMessageCodec 不认识 Optional，编码时直接抛异常。
+      let fallbackIdentifier = AVSpeechSynthesisVoice(language: "zh-CN")?.identifier ?? ""
+      result([
+        "engines": voices.map { ["package": $0.identifier, "label": $0.name] },
+        "defaultEngine": fallbackIdentifier,
+      ])
+
+    case "initialize":
+      if let identifier = args["engine"] as? String, !identifier.isEmpty,
+        let picked = AVSpeechSynthesisVoice(identifier: identifier)
+      {
+        voice = picked
+      } else {
+        voice = AVSpeechSynthesisVoice(language: "zh-CN")
+      }
+      if let value = (args["rate"] as? NSNumber)?.floatValue, value > 0 { rate = value }
+      if let value = (args["volume"] as? NSNumber)?.floatValue { volume = value }
+      // 后台朗读（锁屏继续念）必须有 active 的 playback 会话。
+      FqAudioPlayer.activateSession()
+      // 返回单段最大字数：中文一句 300 字足够，再长引擎会自己断句。
+      result(300)
+
+    case "speak":
+      guard let text = args["text"] as? String, !text.isEmpty,
+        let id = args["id"] as? String
+      else {
+        result(FlutterError(code: "BAD_ARGUMENT", message: "缺少 text/id", details: nil))
+        return
+      }
+      let shouldQueue = (args["queue"] as? Bool) ?? false
+      result(speak(text: text, id: id, queue: shouldQueue))
+
+    case "setVolume":
+      volume = (args["volume"] as? NSNumber)?.floatValue ?? 1
+      result(nil)
+
+    case "setRate":
+      let value = (args["rate"] as? NSNumber)?.floatValue ?? 1
+      if value > 0 { rate = value }
+      result(nil)
+
+    case "getPlaybackSettings":
+      result(["volume": volume, "rate": rate])
+
+    case "stop", "shutdown":
+      synthesizer.stopSpeaking(at: .immediate)
+      lock.lock()
+      utteranceIds.removeAll()
+      lock.unlock()
+      result(nil)
+
+    case "pause":
+      // 只暂停不丢弃：Dart 侧 resume 会重新走 speak(flush)，届时会先 stop。
+      synthesizer.pauseSpeaking(at: .immediate)
+      result(nil)
+
+    case "settings":
+      if let url = URL(string: UIApplication.openSettingsURLString) {
+        UIApplication.shared.open(url)
+      }
+      result(nil)
+
+    default:
+      result(FlutterMethodNotImplemented)
+    }
+  }
+
+  private func speak(text: String, id: String, queue: Bool) -> Any? {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      if !queue {
+        // 新的一段朗读：`stopSpeaking` 会同步触发旧 utterance 的 didCancel，
+        // 那里只清映射不发事件，所以不会把 done 误报给 Dart。
+        self.synthesizer.stopSpeaking(at: .immediate)
+      }
+      let utterance = AVSpeechUtterance(string: text)
+      utterance.voice = self.voice ?? AVSpeechSynthesisVoice(language: "zh-CN")
+      // Dart 的 rate 是 0.5–3 的倍速，AVSpeechUtterance.rate 是 0–1 的绝对语速，
+      // 默认 0.5 对应「正常」。
+      let scaled = AVSpeechUtteranceDefaultSpeechRate * self.rate
+      utterance.rate = min(
+        max(scaled, AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
+      utterance.volume = self.volume
+      self.lock.lock()
+      self.utteranceIds[ObjectIdentifier(utterance)] = id
+      self.lock.unlock()
+      self.synthesizer.speak(utterance)
+    }
+    return nil
+  }
+
+  private func identifier(of utterance: AVSpeechUtterance) -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return utteranceIds[ObjectIdentifier(utterance)]
+  }
+
+  @discardableResult
+  private func takeIdentifier(of utterance: AVSpeechUtterance) -> String? {
+    lock.lock()
+    defer { lock.unlock() }
+    return utteranceIds.removeValue(forKey: ObjectIdentifier(utterance))
+  }
+
+  // MARK: AVSpeechSynthesizerDelegate
+
+@objc func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+    guard let id = identifier(of: utterance) else { return }
+    emit(["type": "start", "id": id])
+  }
+
+@objc func speechSynthesizer(
+    _ synthesizer: AVSpeechSynthesizer, willSpeakRangeOfSpeechString characterRange: NSRange,
+    utterance: AVSpeechUtterance
+  ) {
+    guard let id = identifier(of: utterance) else { return }
+    emit(["type": "range", "id": id, "start": characterRange.location])
+  }
+
+@objc func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+    guard let id = takeIdentifier(of: utterance) else { return }
+    emit(["type": "done", "id": id])
+  }
+
+@objc func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+    // 主动打断（换章、暂停、shutdown）不是「念完了」，绝不能报 done，
+    // 否则 Dart 侧会把游标推到下一段。
+    _ = takeIdentifier(of: utterance)
+  }
+
+  // MARK: 音频中断（来电 / 导航 / 其他 App 抢焦点）
+
+  private func startObservingInterruptions() {
+    guard !observingInterruptions else { return }
+    observingInterruptions = true
+    NotificationCenter.default.addObserver(
+      self, selector: #selector(handleInterruption(_:)),
+      name: AVAudioSession.interruptionNotification, object: nil)
+  }
+
+  @objc private func handleInterruption(_ note: Notification) {
+    guard let info = note.userInfo,
+      let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+      let type = AVAudioSession.InterruptionType(rawValue: raw)
+    else { return }
+    switch type {
+    case .began:
+      // keepFocus: true —— Dart 侧会按「临时打断」处理，焦点交还时自动续播。
+      synthesizer.pauseSpeaking(at: .immediate)
+      emit(["type": "interrupted", "keepFocus": true])
+    case .ended:
+      let options = (info[AVAudioSessionInterruptionOptionKey] as? UInt).map {
+        AVAudioSession.InterruptionOptions(rawValue: $0)
+      }
+      if options?.contains(.shouldResume) ?? false {
+        emit(["type": "focus_resume"])
+      }
+    @unknown default:
+      break
+    }
   }
 }
