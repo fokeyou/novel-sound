@@ -496,9 +496,9 @@ final class FqAudioPlayer {
 
       // 先判定容器类型，结果无论如何都记进诊断：C 核心后面失败时，
       // 这一行就是「该不该解密」的直接证据。
-      let probe = FqMp4Probe.describe(url: self.url)
-      FqDiag.add("mp4:\(probe)")
-      let plain = FqMp4Probe.isPlain(probe)
+      let verdict = FqMp4Probe.inspect(url: self.url)
+      FqDiag.add("probe:\(verdict.described)")
+      let plain = verdict.plain
       if plain && !self.keyHex.isEmpty { FqDiag.add("bypass:plain") }
 
       let asset: AVURLAsset
@@ -568,15 +568,27 @@ final class FqAudioPlayer {
     // 第三个看门狗，专门抓「状态正常但根本没动」：时长出来了（说明解析成功、
     // status 已是 readyToPlay）、用户也想播，可 8 秒过去播放位置还是 0。
     // 这种情况下前两个看门狗都不会响，界面只会安静地停在 00:00。
-    DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in
+    DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
       guard let self, !self.disposed, self.wantPlay,
         let currentItem = self.item, let currentPlayer = self.player,
-        currentItem.status == .readyToPlay,
         CMTimeGetSeconds(currentPlayer.currentTime()) < 0.15
       else { return }
+      // 不要求 status 已经是 readyToPlay：数据不对时它会一直停在 unknown，
+      // 界面上就是永远的「缓冲中...」，既不报错也不前进——比报错更难查。
+      let status: String
+      switch currentItem.status {
+      case .unknown: status = "unknown"
+      case .readyToPlay: status = "ready"
+      case .failed: status = "failed"
+      @unknown default: status = "?"
+      }
       let keepUp = currentItem.isPlaybackLikelyToKeepUp
       let reason = currentPlayer.reasonForWaitingToPlay?.rawValue ?? "none"
-      self.emitError("已就绪但 8s 无进度 keepUp=\(keepUp) wait=\(reason)")
+      let buffered =
+        currentItem.loadedTimeRanges.map { "\(CMTimeGetSeconds($0.timeRangeValue.duration))" }
+        .joined(separator: ",")
+      self.emitError(
+        "6s 无进度 status=\(status) keepUp=\(keepUp) wait=\(reason) buf=\(buffered)")
     }
 
     if startMs > 0 {
@@ -745,34 +757,85 @@ final class FqAudioPlayer {
 // 这一步完全走 URLSession，不经过 C 核心，所以即使解密链路打不开，
 // 也能回答那个最根本的问题：这份音频到底需不需要解密。
 enum FqMp4Probe {
-  static func describe(url: URL) -> String {
-    guard !url.isFileURL else { return "file" }
-    guard let data = head(url), !data.isEmpty else { return "net:fail" }
-    var marks: [String] = []
-    if has(data, "enca") { marks.append("enca") }
-    if has(data, "sinf") { marks.append("sinf") }
-    if has(data, "cenc") { marks.append("cenc") }
-    if has(data, "cbcs") { marks.append("cbcs") }
-    if has(data, "mp4a") { marks.append("mp4a") }
-    marks.append(has(data, "moov") ? "moov" : "no-moov")
-    return marks.joined(separator: "+") + "/\(data.count)B"
+  struct Verdict {
+    /// 写进诊断的一行摘要。
+    let described: String
+    /// 这份文件是否应该**跳过**解密、直接交给 AVPlayer。
+    let plain: Bool
   }
 
-  /// moov 在头部、且完全找不到加密标记 —— 这种文件按明文播就是对的。
-  static func isPlain(_ described: String) -> Bool {
-    described.contains("moov")
-      && !described.contains("no-moov")
-      && !described.contains("sinf")
-      && !described.contains("enca")
+  /// CENC 只可能出现在 ISO BMFF（mp4/m4a/m4v）容器里。所以顺序必须是
+  /// 「先认容器，再看加密标记」——之前反过来，只找 moov：服务端 TTS 合成的
+  /// mp3 压根没有 moov，被判成「未知」，于是照样送进解密核心。拿明文去解密
+  /// 得到的是乱码，播放器能嗅出一点点帧头就一直「缓冲中」，永远不出声。
+  static func inspect(url: URL) -> Verdict {
+    guard !url.isFileURL else { return Verdict(described: "file", plain: false) }
+    guard let first = fetch(url, from: 0, to: 65535) else {
+      return Verdict(described: "net:fail", plain: false)
+    }
+    let head = first.data
+    let container = sniff(head)
+    var marks = ["kind:\(container)"]
+
+    if container != "mp4" {
+      // mp3 / ogg / wav / 任何非 BMFF：一定没有 CENC，解密只会毁掉它。
+      marks.append("plain")
+      return Verdict(described: marks.joined(separator: "+"), plain: true)
+    }
+
+    if has(head, "moov") {
+      marks.append(contentsOf: cencMarks(head))
+      let plain = !has(head, "sinf") && !has(head, "enca")
+      marks.append(plain ? "plain" : "cenc")
+      return Verdict(described: marks.joined(separator: "+"), plain: plain)
+    }
+
+    // moov 在尾部：拉最后 256KB 再判。
+    marks.append("moov-tail")
+    if first.total > 65536 {
+      let from = max(0, first.total - 262_144)
+      if let tail = fetch(url, from: from, to: first.total - 1) {
+        marks.append(contentsOf: cencMarks(tail.data))
+        let plain = !has(tail.data, "sinf") && !has(tail.data, "enca")
+        marks.append(plain ? "plain" : "cenc")
+        return Verdict(described: marks.joined(separator: "+"), plain: plain)
+      }
+    }
+    marks.append("unknown")
+    return Verdict(described: marks.joined(separator: "+"), plain: false)
+  }
+
+  /// 按魔数认容器。ISO BMFF 的第一个 box 一定在偏移 4 处。
+  private static func sniff(_ data: Data) -> String {
+    guard data.count >= 12 else { return "tiny" }
+    let magic = [UInt8](data.prefix(4))
+    if magic == [0x49, 0x44, 0x33] { return "mp3" }  // "ID3"
+    if magic[0] == 0xFF, (magic[1] & 0xE0) == 0xE0 { return "mp3" }  // 帧同步
+    if magic == Array("OggS".utf8) { return "ogg" }
+    if magic == Array("RIFF".utf8) { return "wav" }
+    if magic == Array("fLaC".utf8) { return "flac" }
+    let fourcc = String(bytes: data[4..<8], encoding: .isoLatin1) ?? ""
+    let boxes = ["ftyp", "styp", "moov", "moof", "mdat", "free", "skip", "wide", "pnot"]
+    if boxes.contains(fourcc) { return "mp4" }
+    return "other"
+  }
+
+  private static func cencMarks(_ data: Data) -> [String] {
+    var out: [String] = []
+    for tag in ["enca", "sinf", "cenc", "cbcs", "pssh"] where has(data, tag) {
+      out.append(tag)
+    }
+    return out
   }
 
   private static func has(_ data: Data, _ ascii: String) -> Bool {
     data.range(of: Data(ascii.utf8)) != nil
   }
 
-  private static func head(_ url: URL) -> Data? {
+  private static func fetch(_ url: URL, from: Int64, to: Int64?) -> (data: Data, total: Int64)? {
     var request = URLRequest(url: url)
-    request.setValue("bytes=0-65535", forHTTPHeaderField: "Range")
+    let tail = to.map { "\($0)" } ?? ""
+    request.setValue("bytes=\(from)-\(tail)", forHTTPHeaderField: "Range")
     request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
     request.timeoutInterval = 8
     let configuration = URLSessionConfiguration.ephemeral
@@ -783,12 +846,26 @@ enum FqMp4Probe {
 
     let semaphore = DispatchSemaphore(value: 0)
     var payload: Data?
-    session.dataTask(with: request) { data, _, _ in
+    var response: HTTPURLResponse?
+    session.dataTask(with: request) { data, resp, _ in
       payload = data
+      response = resp as? HTTPURLResponse
       semaphore.signal()
     }.resume()
     if semaphore.wait(timeout: .now() + 9) == .timedOut { return nil }
-    return payload
+    guard let payload, let response else { return nil }
+
+    var total: Int64 = -1
+    if let range = response.value(forHTTPHeaderField: "Content-Range"),
+      let slash = range.lastIndex(of: "/")
+    {
+      let value = range[range.index(after: slash)...].trimmingCharacters(in: .whitespaces)
+      if value != "*" { total = Int64(value) ?? -1 }
+    }
+    if total <= 0, let declared = response.value(forHTTPHeaderField: "Content-Length") {
+      total = Int64(declared) ?? -1
+    }
+    return (payload, total)
   }
 }
 
